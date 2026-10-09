@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -10,9 +10,6 @@ from .api import MiniDSPAPI
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-
-# Precision for level values
-# _ROUND_PRECISION = 0
 
 
 class MiniDSPCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -26,7 +23,7 @@ class MiniDSPCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=None,
         )
         self._api = api
-        self._unsubscribe_ws: callable | None = None
+        self._unsubscribe_ws: Callable[[], None] | None = None
         # Expose to entities
         self.base_url = api._base_url  # pragma: no cover
         self.address = self.base_url  # alias for clarity
@@ -65,12 +62,9 @@ class MiniDSPCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ):
                         current["master"] = {}
 
-                    # Round numeric fields and merge
+                    # Preserve the device's volume precision and boolean states.
                     merged_master = dict(current["master"])
-                    for m_key, m_val in incoming_master.items():
-                        if isinstance(m_val, (int, float)):
-                            m_val = int(round(m_val))
-                        merged_master[m_key] = m_val
+                    merged_master.update(incoming_master)
 
                     if merged_master != current["master"]:
                         current["master"] = merged_master
@@ -93,11 +87,17 @@ class MiniDSPCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             current[key] = new_list
                             updated = True
 
-            if updated:
+            if updated or not self.last_update_success:
                 # Push incremental update to listeners
                 self.async_set_updated_data(current)
 
-        self._unsubscribe_ws = await self._api.async_subscribe_levels(_levels_callback)
+        async def _connection_callback(connected: bool) -> None:
+            if not connected:
+                self.async_set_update_error(UpdateFailed("Connection to MiniDSP lost"))
+
+        self._unsubscribe_ws = await self._api.async_subscribe_levels(
+            _levels_callback, _connection_callback
+        )
 
     async def async_disconnect(self):
         if self._unsubscribe_ws:
@@ -106,15 +106,11 @@ class MiniDSPCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._api.async_disconnect()
 
     def _rounded_levels(self, data: dict[str, Any]) -> dict[str, Any]:
-        def _round_val(val: Any):
-            return int(round(val)) if isinstance(val, (int, float)) else val
-
-        rounded_data: dict[str, Any] = {}
-        for key, value in data.items():
-            if isinstance(value, (list, tuple)):
-                rounded_data[key] = [_round_val(v) for v in value]
-            elif isinstance(value, dict):
-                rounded_data[key] = {k: _round_val(v) for k, v in value.items()}
-            else:
-                rounded_data[key] = _round_val(value)
+        rounded_data = dict(data)
+        for key in ("input_levels", "output_levels"):
+            if key in data:
+                rounded_data[key] = [
+                    int(round(value)) if isinstance(value, (int, float)) else value
+                    for value in data[key]
+                ]
         return rounded_data

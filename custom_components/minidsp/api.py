@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from typing import Any, Callable, Coroutine
 
 import aiohttp
@@ -24,6 +25,10 @@ class MiniDSPAPI:
         self._listeners: list[
             Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
         ] = []
+        self._connection_listeners: list[
+            Callable[[bool], Coroutine[Any, Any, None]]
+        ] = []
+        self._connected: bool | None = None
         self._stop_event = asyncio.Event()
 
     # ---------------------------------------------------------------------
@@ -68,32 +73,46 @@ class MiniDSPAPI:
     # ----------------------- websocket handling -------------------------
 
     async def async_subscribe_levels(
-        self, callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
+        self,
+        callback: Callable[[dict[str, Any]], Coroutine[Any, Any, None]],
+        connection_callback: Callable[[bool], Coroutine[Any, Any, None]] | None = None,
     ) -> Callable[[], None]:
         """Subscribe to live level updates.
 
-        The callback will receive a dict containing at least `input_levels` and
-        `output_levels` whenever a new message is received.
+        The callback receives incremental status and level updates.
+        The optional connection callback reports loss of the stream and recovery
+        after a valid status message is received.
         Returns an unsubscribe callback.
         """
         self._listeners.append(callback)
+        if connection_callback is not None:
+            self._connection_listeners.append(connection_callback)
 
-        if self._ws_task is None:
+        if self._ws_task is None or self._ws_task.done():
+            self._stop_event.clear()
+            self._connected = None
             self._ws_task = asyncio.create_task(self._ws_listener_task())
 
         def _unsubscribe() -> None:
             if callback in self._listeners:
                 self._listeners.remove(callback)
+            if connection_callback in self._connection_listeners:
+                self._connection_listeners.remove(connection_callback)
             if not self._listeners:
                 self._stop_event.set()
+                if self._ws_task is not None:
+                    self._ws_task.cancel()
 
         return _unsubscribe
 
     async def async_disconnect(self) -> None:
         """Cancel the websocket task (if any)."""
-        if self._ws_task and not self._ws_task.done():
-            self._stop_event.set()
-            await self._ws_task
+        self._stop_event.set()
+        if self._ws_task is not None:
+            self._ws_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._ws_task
+            self._ws_task = None
 
     # ---------------------------------------------------------------------
 
@@ -107,6 +126,8 @@ class MiniDSPAPI:
                 async with self._session.ws_connect(ws_url, heartbeat=30) as ws:
                     backoff = 1.0  # Reset backoff after successful connect
                     async for msg in ws:
+                        if self._stop_event.is_set():
+                            break
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = json.loads(msg.data)
@@ -115,8 +136,12 @@ class MiniDSPAPI:
                                     "Failed to decode websocket message: %s", err
                                 )
                                 continue
+                            if not isinstance(data, dict):
+                                _LOGGER.warning("Ignoring non-object websocket message")
+                                continue
                             _LOGGER.debug("Websocket message: %s", data)
                             await self._dispatch_event(data)
+                            await self._notify_connection(True)
                         elif msg.type == aiohttp.WSMsgType.CLOSED:
                             _LOGGER.debug("Websocket closed")
                             break
@@ -128,6 +153,8 @@ class MiniDSPAPI:
 
             if self._stop_event.is_set():
                 break
+
+            await self._notify_connection(False)
 
             # Reconnect with exponential backoff
             await asyncio.sleep(backoff)
@@ -141,6 +168,16 @@ class MiniDSPAPI:
                 await cb(event)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.exception("Listener raised: %s", err)
+
+    async def _notify_connection(self, connected: bool) -> None:
+        if self._connected == connected:
+            return
+        self._connected = connected
+        for callback in list(self._connection_listeners):
+            try:
+                await callback(connected)
+            except Exception as err:
+                _LOGGER.exception("Connection listener raised: %s", err)
 
     # ---------------------------------------------------------------------
 

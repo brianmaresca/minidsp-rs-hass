@@ -5,6 +5,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_URL, CONF_NAME
+from homeassistant.core import callback
 import voluptuous as vol
 
 from .const import DOMAIN
@@ -18,6 +19,14 @@ class MiniDSPConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for the MiniDSP integration."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> MiniDSPOptionsFlow:
+        """Create the options flow for this entry."""
+        return MiniDSPOptionsFlow(config_entry)
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -56,10 +65,3 @@ class MiniDSPOptionsFlow(config_entries.OptionsFlow):
         )
         schema = vol.Schema({vol.Required(CONF_URL, default=current_url): str})
         return self.async_show_form(step_id="init", data_schema=schema)
-
-
-# Hook for Home Assistant to retrieve the options flow
-
-
-async def async_get_options_flow(config_entry: config_entries.ConfigEntry):  # type: ignore[override]
-    return MiniDSPOptionsFlow(config_entry)
